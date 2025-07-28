@@ -6,7 +6,7 @@ patool
 reformer_pytorch
 scikit_learn
 scipy
-sktime==0.4.1
+sktime
 sympy
 torch
 tqdm
