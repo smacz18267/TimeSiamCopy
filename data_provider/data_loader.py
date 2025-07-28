@@ -9,7 +9,7 @@ from utils.timefeatures import time_features
 from utils.tools import lineage_search
 from data_provider.m4 import M4Dataset, M4Meta
 from data_provider.uea import subsample, interpolate_missing, Normalizer
-from sktime.utils import load_data
+from utils.sktime_compat import load_ucr_uea, load_tsfile_to_numpy3d
 import warnings
 from sklearn.preprocessing import StandardScaler
 import random
