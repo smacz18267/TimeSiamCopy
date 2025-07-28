@@ -4,6 +4,8 @@ from exp.pretrain import Exp_Train, Exp_Pretrain_TimeSiam, Exp_Pretrain_PatchTST
 import random
 import numpy as np
 import os
+from exp.exp_classify import Exp_Classify
+
 os.environ['CUDA_LAUNCH_BLOCKING'] = '0'
 
 parser = argparse.ArgumentParser(description='TimeSiam')
@@ -15,6 +17,16 @@ parser.add_argument('--task_name', type=str, required=True, default='in_domain',
 parser.add_argument('--is_training', type=int, required=True, default=1, help='status')
 parser.add_argument('--model_id', type=str, required=True, default='test', help='model id')
 parser.add_argument('--model', type=str, required=True, default='PatchTST', help='model name, options: [PatchTST, iTransformer]')
+
+parser.add_argument('--cls_task', type=str, default='binary',
+                    help='classification target: binary (uses label[:,0]) or id (uses label[:,1])')
+parser.add_argument('--data_root', type=str, default='./AD',
+                    help='path to AD dataset root (contains Feature/ and Label/)')
+parser.add_argument('--emb_dim', type=int, default=256, help='embedding dim for Siamese encoder')
+parser.add_argument('--contrastive_weight', type=float, default=0.5, help='weight for contrastive loss')
+parser.add_argument('--ce_weight', type=float, default=1.0, help='weight for cross-entropy loss')
+parser.add_argument('--val_split', type=float, default=0.2, help='validation split for classification')
+parser.add_argument('--pair_mode', type=int, default=1, help='1: train with pair sampling + CE, 0: CE only')
 
 # data loader
 parser.add_argument('--data', type=str, required=True, default='ETTm1', help='dataset type')
@@ -128,7 +140,9 @@ torch.manual_seed(fix_seed)
 np.random.seed(fix_seed)
 
 
-if args.task_name == 'timesiam':
+if args.task_name == 'classify':
+    Exp = Exp_Classify
+elif args.task_name == 'timesiam':
     Exp = Exp_Pretrain_TimeSiam
 elif args.task_name == 'patchtst':
     Exp = Exp_Pretrain_PatchTST
@@ -136,6 +150,16 @@ else:
     Exp = Exp_Train
 
 print(Exp)
+
+if args.task_name == 'classify':
+    setting = f"classify_{args.model_id}"
+    exp = Exp(args)
+    if args.is_training == 1:
+        for ii in range(args.itr):
+            exp.train(setting)
+    else:
+        for ii in range(args.itr):
+            exp.test(setting, test=1)
 
 if args.is_training == 0:
     for ii in range(args.itr):
