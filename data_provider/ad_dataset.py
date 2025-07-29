@@ -72,7 +72,7 @@ class ADDataset(Dataset):
 
     def __getitem__(self, idx: int):
         if not self.pair_mode:
-            x = self._load_x(idx)                  # (C*F, L)
+            x = self._load_x(idx).float()            
             y = int(self.y[idx])
             # --- return tensors with owned storage/dtypes set ---
             return x.float(), torch.tensor(y, dtype=torch.long)
@@ -92,4 +92,4 @@ class ADDataset(Dataset):
         # --- make labels tensors now to avoid dtype surprises in collate ---
         y_sim = torch.tensor(y_sim, dtype=torch.float32)  # contrastive target
         y_anchor = torch.tensor(y_anchor, dtype=torch.long)
-        return xi, xj, y_sim, y_anchor
+        return xi.float(), xj.float(), y_sim, y_anchor
