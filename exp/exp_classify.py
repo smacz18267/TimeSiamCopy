@@ -8,7 +8,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, Subset
 from sklearn.metrics import (
     accuracy_score, precision_recall_fscore_support,
-    roc_auc_score, average_precision_score
+    roc_auc_score, average_precision_score, confusion_matrix
 )
 from sklearn.model_selection import StratifiedShuffleSplit
 
@@ -30,7 +30,7 @@ class TrainConfig:
     num_workers: int = 0
     device: str = "cuda" if (torch.cuda.is_available()) else "cpu"
     val_split: float = 0.2
-    test_split: float = 0.2        # used for held-out testing
+    test_split: float = 0.2        # held-out test
     pair_mode: bool = True
     seed: int = 42
 
@@ -60,7 +60,7 @@ class Exp_Classify:
         torch.manual_seed(self.cfg.seed)
         np.random.seed(self.cfg.seed)
 
-        # Build a base dataset in pair mode (for contrastive), scan shapes to set fixed pad size
+        # Base dataset (pair-mode) just to scan shapes & for contrastive
         base_pair = ADDataset(self.cfg.data_dir, task=self.cfg.task, pair_mode=True)
         self.num_classes = base_pair.num_classes
 
@@ -74,26 +74,25 @@ class Exp_Classify:
         self.fixed_C, self.fixed_L = max_C, max_L
 
         # Build the classifier
-        self.model = SiameseClassifier(self.fixed_C, self.num_classes, emb_dim=self.cfg.emb_dim).to(self.cfg.device)
+        self.model = SiameseClassifier(self.fixed_C, self.num_classes,
+                                       emb_dim=self.cfg.emb_dim).to(self.cfg.device)
 
         # Optional: load checkpoint (for fine-tune or test)
         ckpt = getattr(self.args, 'load_checkpoints', None)
         if ckpt:
             if os.path.exists(ckpt):
-                state = torch.load(ckpt, map_location='cpu')
+                state = torch.load(ckpt, map_mode='cpu') if hasattr(torch.load, '__call__') else torch.load(ckpt, map_location='cpu')
                 self.model.load_state_dict(state)
                 print(f"Loaded checkpoint: {ckpt}")
             else:
                 print(f"[Warn] --load_checkpoints given but file not found: {ckpt}")
 
         # ---------- Reproducible stratified train/val/test split at FILE level ----------
-        # We split based on single-sample labels (pair_mode=False) so labels are explicit.
         base_single = ADDataset(self.cfg.data_dir, task=self.cfg.task, pair_mode=False)
         y_all = np.array([int(base_single.y[i]) for i in range(len(base_single))], dtype=int)
 
-        # path to persist indices (so train/test are consistent across runs)
         os.makedirs('./outputs/splits_classify', exist_ok=True)
-        split_tag = getattr(args, 'model_id', 'AD')  # helps keep separate runs apart
+        split_tag = getattr(args, 'model_id', 'AD')
         self.splits_path = f'./outputs/splits_classify/{split_tag}_{self.cfg.task}_seed{self.cfg.seed}.npz'
 
         if os.path.exists(self.splits_path):
@@ -103,10 +102,9 @@ class Exp_Classify:
             self.test_idx  = pack['test_idx']
             print(f"Loaded splits from {self.splits_path} (train {len(self.train_idx)}, val {len(self.val_idx)}, test {len(self.test_idx)})")
         else:
-            # First split off test
+            idx_all = np.arange(len(y_all))
             test_frac = float(self.cfg.test_split)
             val_frac  = float(self.cfg.val_split)
-            idx_all = np.arange(len(y_all))
 
             if test_frac > 0:
                 sss_test = StratifiedShuffleSplit(n_splits=1, test_size=test_frac, random_state=self.cfg.seed)
@@ -114,7 +112,6 @@ class Exp_Classify:
             else:
                 trainval_idx, test_idx = idx_all, np.array([], dtype=int)
 
-            # Then split train/val
             if val_frac > 0:
                 sss_val = StratifiedShuffleSplit(n_splits=1, test_size=val_frac/(1.0 - test_frac + 1e-12),
                                                  random_state=self.cfg.seed)
@@ -129,14 +126,25 @@ class Exp_Classify:
             np.savez(self.splits_path, train_idx=self.train_idx, val_idx=self.val_idx, test_idx=self.test_idx)
             print(f"Saved splits to {self.splits_path} (train {len(self.train_idx)}, val {len(self.val_idx)}, test {len(self.test_idx)})")
 
-        # Build Dataset objects for each split
-        # pair-mode for contrastive, single-mode for CE/eval
+        # Build Datasets for each split
         self.ds_pair = base_pair
         self.ds_ce   = base_single
 
-        self.ds_pair.set_pair_sampling_pool(self.train_idx)
+        # restrict pair sampling to train only (prevents leakage)
+        if hasattr(self.ds_pair, "set_pair_sampling_pool"):
+            self.ds_pair.set_pair_sampling_pool(self.train_idx)
+
+        # (Optional) leakage sanity check
+        try:
+            if hasattr(self.ds_pair, "_pool_indices") and self.ds_pair._pool_indices is not None:
+                pool = set(int(i) for i in self.ds_pair._pool_indices.tolist())
+                overlap = (set(self.val_idx.tolist()) | set(self.test_idx.tolist())) & pool
+                print(f"[DEBUG] Pair-sampling pool size: {len(pool)} | overlap val/test: {len(overlap)} (must be 0)")
+        except Exception:
+            pass
+
         self.train_pair = Subset(self.ds_pair, self.train_idx)
-        self.val_pair   = Subset(self.ds_pair, self.val_idx)   # not used directly but kept for symmetry
+        self.val_pair   = Subset(self.ds_pair, self.val_idx)
         self.train_ce   = Subset(self.ds_ce,   self.train_idx)
         self.val_ce     = Subset(self.ds_ce,   self.val_idx)
         self.test_ce    = Subset(self.ds_ce,   self.test_idx if len(self.test_idx) > 0 else self.val_idx)
@@ -145,11 +153,10 @@ class Exp_Classify:
         self.opt = optim.Adam(self.model.parameters(), lr=self.cfg.lr, weight_decay=self.cfg.weight_decay)
 
         # threshold chosen on validation (used in test)
-        self.val_threshold = 0.5
+        self.best_threshold = 0.5
 
     # ===== Collate helpers that PAD/TRUNCATE to (fixed_C, fixed_L) =====
     def _pad_to_fixed(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (C, L)
         C, L = x.shape
         C_new = min(self.fixed_C, C)
         L_new = min(self.fixed_L, L)
@@ -182,8 +189,7 @@ class Exp_Classify:
         y_sim = y_sim.to(self.cfg.device).float()
         z1 = self.model.embed(xi)
         z2 = self.model.embed(xj)
-        loss_c = contrastive_loss(z1, z2, y_sim, margin=1.0)
-        return loss_c
+        return contrastive_loss(z1, z2, y_sim, margin=1.0)
 
     def _step_ce(self, batch):
         x, y = batch
@@ -192,7 +198,7 @@ class Exp_Classify:
         logits = self.model(x)
         return nn.CrossEntropyLoss()(logits, y)
 
-    # ===== Metrics / evaluation =====
+    # ===== Evaluation helpers =====
     def _eval_pass(self, loader):
         self.model.eval()
         ys, ps = [], []
@@ -224,52 +230,87 @@ class Exp_Classify:
         return {"acc": acc, "precision": precision, "recall": recall,
                 "f1": f1, "auc": auc, "auprc": auprc}
 
-    def _pick_threshold_on_val(self, y_true, p_pos):
-        # choose threshold maximizing F1 on validation
-        if len(np.unique(y_true)) < 2:
-            return 0.5  # fallback if val is single-class
-        cand = np.linspace(0.01, 0.99, 99)
-        best_t, best_f1 = 0.5, -1.0
-        for t in cand:
-            y_pred = (p_pos >= t).astype(int)
-            _, _, f1, _ = precision_recall_fscore_support(
+    def _pick_threshold(self, y_true, y_score, method="f1", min_precision=None):
+        """
+        Pick a threshold on validation scores with small-sample stability:
+          - Candidate thresholds = score quantiles from 5%..95%
+          - Optimize F1 (default) or Youden's J
+          - Optionally enforce a minimum precision
+        Returns: best_threshold, stats_at_best
+        """
+        y_true = np.asarray(y_true).astype(int)
+        y_score = np.asarray(y_score).astype(float)
+
+        if np.allclose(y_score, y_score[0]):
+            return 0.5, {"f1": 0.0, "precision": 0.0, "recall": 0.0}
+
+        qs = np.linspace(0.05, 0.95, 19)
+        cands = np.unique(np.quantile(y_score, qs))
+
+        best_t = 0.5
+        best_key = -1.0
+        best_stats = None
+
+        for t in cands:
+            y_pred = (y_score >= t).astype(int)
+            prec, rec, f1, _ = precision_recall_fscore_support(
                 y_true, y_pred, average="binary", zero_division=0
             )
-            if f1 > best_f1:
-                best_f1, best_t = f1, t
-        return best_t
+            if min_precision is not None and prec < min_precision:
+                continue
+
+            if method == "f1":
+                key = f1
+            elif method == "youden":
+                tp = np.sum((y_pred == 1) & (y_true == 1))
+                fn = np.sum((y_pred == 0) & (y_true == 1))
+                tn = np.sum((y_pred == 0) & (y_true == 0))
+                fp = np.sum((y_pred == 1) & (y_true == 0))
+                tpr = tp / (tp + fn + 1e-9)
+                fpr = fp / (fp + tn + 1e-9)
+                key = tpr - fpr
+            else:
+                raise ValueError("Unknown method")
+
+            if key > best_key:
+                best_key = key
+                best_t = float(t)
+                best_stats = {"precision": float(prec), "recall": float(rec), "f1": float(f1)}
+
+        if best_stats is None:
+            # fall back if all candidates filtered by min_precision
+            best_t = float(np.median(y_score))
+            y_pred = (y_score >= best_t).astype(int)
+            prec, rec, f1, _ = precision_recall_fscore_support(
+                y_true, y_pred, average="binary", zero_division=0
+            )
+            best_stats = {"precision": float(prec), "recall": float(rec), "f1": float(f1)}
+
+        return best_t, best_stats
 
     # ===== Public API =====
     def train(self, setting=None):
         print("Starting classification training with config:", self.cfg)
 
         train_pair_loader = DataLoader(
-            self.train_pair,
-            batch_size=self.cfg.batch_size,
-            shuffle=True,
-            num_workers=self.cfg.num_workers,
-            drop_last=False,
+            self.train_pair, batch_size=self.cfg.batch_size, shuffle=True,
+            num_workers=self.cfg.num_workers, drop_last=False,
             collate_fn=self._collate_pair,
         )
         train_ce_loader = DataLoader(
-            self.train_ce,
-            batch_size=self.cfg.batch_size,
-            shuffle=True,
-            num_workers=self.cfg.num_workers,
-            drop_last=False,
+            self.train_ce, batch_size=self.cfg.batch_size, shuffle=True,
+            num_workers=self.cfg.num_workers, drop_last=False,
             collate_fn=self._collate_single,
         )
         val_loader = DataLoader(
-            self.val_ce,
-            batch_size=self.cfg.batch_size,
-            shuffle=False,
-            num_workers=self.cfg.num_workers,
-            drop_last=False,
+            self.val_ce, batch_size=self.cfg.batch_size, shuffle=False,
+            num_workers=self.cfg.num_workers, drop_last=False,
             collate_fn=self._collate_single,
         )
 
         best_metric = -np.inf
         best_state = None
+        best_threshold = 0.5
 
         steps = min(len(train_pair_loader), len(train_ce_loader)) if self.cfg.pair_mode else len(train_ce_loader)
 
@@ -277,8 +318,7 @@ class Exp_Classify:
             self.model.train()
             total_c, total_ce = 0.0, 0.0
 
-            if self.cfg.pair_mode:
-                iter_pair = iter(train_pair_loader)
+            iter_pair = iter(train_pair_loader) if self.cfg.pair_mode else None
             iter_ce = iter(train_ce_loader)
 
             for _ in range(steps):
@@ -290,8 +330,7 @@ class Exp_Classify:
                     loss_c = torch.tensor(0.0, device=self.cfg.device)
 
                 loss_ce = self._step_ce(next(iter_ce)) * self.cfg.ce_weight
-                loss = loss_c + loss_ce
-                loss.backward()
+                (loss_c + loss_ce).backward()
                 self.opt.step()
 
                 total_c += float(loss_c.detach().cpu())
@@ -301,11 +340,10 @@ class Exp_Classify:
             y_val, p_val = self._eval_pass(val_loader)
             if self.cfg.task == 'binary' and self.num_classes >= 2:
                 p_pos = p_val[:, 1]
-                self.val_threshold = self._pick_threshold_on_val(y_val, p_pos)
-                metrics = self._compute_metrics_binary(y_val, p_pos, threshold=self.val_threshold)
+                cur_thr, thr_stats = self._pick_threshold(y_val, p_pos, method="f1", min_precision=0.6)
+                metrics = self._compute_metrics_binary(y_val, p_pos, threshold=cur_thr)
                 score = metrics["auc"] if not np.isnan(metrics["auc"]) else metrics["f1"]
             else:
-                # multi-class (ID)
                 y_pred = p_val.argmax(axis=1)
                 acc = accuracy_score(y_val, y_pred)
                 metrics = {"acc": acc}
@@ -317,22 +355,29 @@ class Exp_Classify:
             if score > best_metric:
                 best_metric = score
                 best_state = {k: v.cpu() for k, v in self.model.state_dict().items()}
+                best_threshold = cur_thr if self.cfg.task == 'binary' and self.num_classes >= 2 else 0.5
 
-        # Save best checkpoint
+        # Save best checkpoint (+ threshold)
         os.makedirs('./outputs/checkpoints_classify', exist_ok=True)
-        ckpt_path = f'./outputs/checkpoints_classify/{(setting or "classify")}_{self.cfg.task}.pt'
+        tag = (setting or "classify")
+        ckpt_path = f'./outputs/checkpoints_classify/{tag}_{self.cfg.task}.pt'
+        thr_path  = f'./outputs/checkpoints_classify/{tag}_{self.cfg.task}_thr.npy'
         if best_state is not None:
             torch.save(best_state, ckpt_path)
+            np.save(thr_path, np.array([best_threshold], dtype=np.float32))
             print(f"Saved best model to {ckpt_path} (best score={best_metric:.4f})")
+            print(f"Saved validation threshold to {thr_path} (thr={best_threshold:.3f})")
         else:
             torch.save(self.model.state_dict(), ckpt_path)
+            np.save(thr_path, np.array([0.5], dtype=np.float32))
             print(f"Saved last model to {ckpt_path}")
 
     def test(self, setting=None, test=0):
         # auto-pick checkpoint if not provided
+        tag = (setting or "classify")
         ckpt = getattr(self.args, 'load_checkpoints', None)
         if ckpt is None:
-            ckpt = f'./outputs/checkpoints_classify/{(setting or "classify")}_{self.cfg.task}.pt'
+            ckpt = f'./outputs/checkpoints_classify/{tag}_{self.cfg.task}.pt'
         if os.path.exists(ckpt):
             state = torch.load(ckpt, map_location='cpu')
             self.model.load_state_dict(state)
@@ -340,32 +385,33 @@ class Exp_Classify:
         else:
             print(f"[Warn] No checkpoint found at {ckpt}; testing current weights.")
 
-        # Build loaders for VAL (to pick threshold) and TEST (held-out)
-        val_loader = DataLoader(
-            self.val_ce,
-            batch_size=self.cfg.batch_size,
-            shuffle=False,
-            num_workers=self.cfg.num_workers,
-            collate_fn=self._collate_single,
-        )
+        # try to load saved threshold; if missing, derive from val
+        thr_path  = f'./outputs/checkpoints_classify/{tag}_{self.cfg.task}_thr.npy'
+        if os.path.exists(thr_path):
+            self.best_threshold = float(np.load(thr_path)[0])
+        else:
+            # compute from val set
+            val_loader = DataLoader(
+                self.val_ce, batch_size=self.cfg.batch_size, shuffle=False,
+                num_workers=self.cfg.num_workers, collate_fn=self._collate_single,
+            )
+            y_v, p_v = self._eval_pass(val_loader)
+            self.best_threshold, _ = self._pick_threshold(y_v, p_v[:, 1], method="f1", min_precision=0.6)
+
+        print(f"Using decision threshold from validation: {self.best_threshold:.2f}")
+
+        # Evaluate on TEST
         test_loader = DataLoader(
-            self.test_ce,
-            batch_size=self.cfg.batch_size,
-            shuffle=False,
-            num_workers=self.cfg.num_workers,
-            collate_fn=self._collate_single,
+            self.test_ce, batch_size=self.cfg.batch_size, shuffle=False,
+            num_workers=self.cfg.num_workers, collate_fn=self._collate_single,
         )
-
-        # Pick threshold on validation, then evaluate on test
         if self.cfg.task == 'binary' and self.num_classes >= 2:
-            y_val, p_val = self._eval_pass(val_loader)
-            p_pos_val = p_val[:, 1]
-            self.val_threshold = self._pick_threshold_on_val(y_val, p_pos_val)
-            print(f"Using decision threshold from validation: {self.val_threshold:.2f}")
-
             y_t, p_t = self._eval_pass(test_loader)
             p_pos_t = p_t[:, 1]
-            metrics = self._compute_metrics_binary(y_t, p_pos_t, threshold=self.val_threshold)
+            metrics = self._compute_metrics_binary(y_t, p_pos_t, threshold=self.best_threshold)
+            y_pred = (p_pos_t >= self.best_threshold).astype(int)
+            cm = confusion_matrix(y_t, y_pred)
+            print("Confusion matrix (test):\n", cm)
         else:
             y_t, p_t = self._eval_pass(test_loader)
             y_pred = p_t.argmax(axis=1)
@@ -375,8 +421,8 @@ class Exp_Classify:
 
         # save metrics JSON
         os.makedirs('./outputs/results_classify', exist_ok=True)
-        tag = f'{(setting or "classify")}_{self.cfg.task}_seed{self.cfg.seed}.json'
-        with open(os.path.join('./outputs/results_classify', tag), 'w') as f:
+        out_name = f'{tag}_{self.cfg.task}_seed{self.cfg.seed}.json'
+        with open(os.path.join('./outputs/results_classify', out_name), 'w') as f:
             json.dump({k: float(v) for k, v in metrics.items()}, f)
-        print(f"Saved test metrics to ./outputs/results_classify/{tag}")
+        print(f"Saved test metrics to ./outputs/results_classify/{out_name}")
         return metrics
