@@ -134,6 +134,7 @@ class Exp_Classify:
         self.ds_pair = base_pair
         self.ds_ce   = base_single
 
+        self.ds_pair.set_pair_sampling_pool(self.train_idx)
         self.train_pair = Subset(self.ds_pair, self.train_idx)
         self.val_pair   = Subset(self.ds_pair, self.val_idx)   # not used directly but kept for symmetry
         self.train_ce   = Subset(self.ds_ce,   self.train_idx)
