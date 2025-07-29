@@ -81,7 +81,7 @@ class Exp_Classify:
         ckpt = getattr(self.args, 'load_checkpoints', None)
         if ckpt:
             if os.path.exists(ckpt):
-                state = torch.load(ckpt, map_mode='cpu') if hasattr(torch.load, '__call__') else torch.load(ckpt, map_location='cpu')
+                state = torch.load(ckpt, map_location='cpu')
                 self.model.load_state_dict(state)
                 print(f"Loaded checkpoint: {ckpt}")
             else:
