@@ -132,6 +132,50 @@ class Exp_Classify:
         self._ce_criterion = None
         self._init_ce_weights()
 
+    def _best_threshold_from_loader(self, loader, task='binary', metric='f1'):
+        """
+        Sweep thresholds on validation to pick the best for a given metric (binary).
+        Returns chosen threshold in [0,1]. Falls back to 0.5 if something goes wrong.
+        """
+        if task != 'binary':
+            return 0.5
+        self.model.eval()
+        ys, ps1 = [], []
+        with torch.no_grad():
+            for x, y in loader:
+                x = x.to(self.cfg.device).float()
+                logits = self.model(x)
+                prob = torch.softmax(logits, dim=1).cpu().numpy()
+                ys.append(y.numpy())
+                ps1.append(prob[:, 1])
+        y_true = np.concatenate(ys, axis=0)
+        p1 = np.concatenate(ps1, axis=0)
+    
+        # guard: if p1 is degenerate
+        if np.allclose(p1, p1[0]):
+            return 0.5
+    
+        # grid of thresholds
+        ts = np.linspace(0.05, 0.95, 19)
+        best_t, best_score = 0.5, -1.0
+        for t in ts:
+            y_pred = (p1 >= t).astype(int)
+            if metric == 'f1':
+                from sklearn.metrics import f1_score
+                s = f1_score(y_true, y_pred, zero_division=0)
+            elif metric == 'youden':
+                from sklearn.metrics import recall_score
+                sens = recall_score(y_true, y_pred, zero_division=0)
+                spec = recall_score(1 - y_true, 1 - y_pred, zero_division=0)
+                s = sens + spec - 1.0
+            else:  # accuracy
+                from sklearn.metrics import accuracy_score
+                s = accuracy_score(y_true, y_pred)
+            if s > best_score:
+                best_score, best_t = s, t
+        return float(best_t)
+
+
     # ----------------------------
     # Splits
     # ----------------------------
@@ -386,7 +430,21 @@ class Exp_Classify:
         else:
             print(f"[Warn] No checkpoint found at {ckpt}; testing current weights.")
 
-        # Test loader (held‑out split from __init__)
+        # Validation loader (to choose threshold for binary tasks)
+        val_loader = DataLoader(
+            self.val_ce,
+            batch_size=self.cfg.batch_size,
+            shuffle=False,
+            num_workers=self.cfg.num_workers,
+            drop_last=False,
+            collate_fn=self._collate_single,
+        )
+    
+        # Pick threshold on val (binary only). Returns 0.5 for multi-class.
+        best_thr = self._best_threshold_from_loader(val_loader, task=self.cfg.task, metric='f1')
+        print(f"Using decision threshold from validation: {best_thr:.2f}")
+    
+        # Test loader
         loader = DataLoader(
             self.test_ce,
             batch_size=self.cfg.batch_size,
@@ -395,7 +453,37 @@ class Exp_Classify:
             drop_last=False,
             collate_fn=self._collate_single,
         )
-        metrics = self._evaluate(loader, task=self.cfg.task)
+    
+        # Evaluate with threshold applied for acc/prec/recall/f1; AUC/AUPRC unaffected
+        self.model.eval()
+        ys, ps = [], []
+        with torch.no_grad():
+            for x, y in loader:
+                x = x.to(self.cfg.device).float()
+                logits = self.model(x)
+                prob = torch.softmax(logits, dim=1).cpu().numpy()
+                ys.append(y.numpy()); ps.append(prob)
+        y_true = np.concatenate(ys, axis=0)
+        y_prob = np.concatenate(ps, axis=0)
+        y_pred = (y_prob[:,1] >= best_thr).astype(int) if (self.cfg.task=='binary' and y_prob.shape[1]>=2) else y_prob.argmax(1)
+    
+        from sklearn.metrics import (
+            accuracy_score, precision_recall_fscore_support,
+            roc_auc_score, average_precision_score
+        )
+        metrics = {}
+        metrics['acc'] = float(accuracy_score(y_true, y_pred))
+        if self.cfg.task == 'binary' and y_prob.shape[1] >= 2:
+            pr, rc, f1, _ = precision_recall_fscore_support(y_true, y_pred, average='binary', zero_division=0)
+            metrics['precision'] = float(pr); metrics['recall'] = float(rc); metrics['f1'] = float(f1)
+            try: metrics['auc'] = float(roc_auc_score(y_true, y_prob[:,1]))
+            except: metrics['auc'] = float('nan')
+            try: metrics['auprc'] = float(average_precision_score(y_true, y_prob[:,1]))
+            except: metrics['auprc'] = float('nan')
+        else:
+            pr, rc, f1, _ = precision_recall_fscore_support(y_true, y_pred, average='macro', zero_division=0)
+            metrics['precision'] = float(pr); metrics['recall'] = float(rc); metrics['f1'] = float(f1)
+        # (multi-class AUC/AUPRC as before if you want)
         print("Test metrics:", metrics)
 
         # Dump JSON for aggregation (e.g., 5‑seed mean±std)
