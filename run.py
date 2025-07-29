@@ -154,12 +154,16 @@ print(Exp)
 if args.task_name == 'classify':
     setting = f"classify_{args.model_id}"
     exp = Exp(args)
+
     if args.is_training == 1:
-        for ii in range(args.itr):
-            exp.train(setting)
+        exp.train(setting)
     else:
-        for ii in range(args.itr):
-            exp.test(setting, test=1)
+        # if no checkpoint explicitly provided, auto-pick the one saved by train()
+        if args.load_checkpoints is None:
+            args.load_checkpoints = f'./outputs/checkpoints_classify/{setting}_{args.cls_task}.pt'
+        exp.test(setting, test=1)
+    import sys
+    sys.exit(0)
 
 if args.is_training == 0:
     for ii in range(args.itr):
