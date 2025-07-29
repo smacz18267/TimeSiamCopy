@@ -27,6 +27,10 @@ parser.add_argument('--contrastive_weight', type=float, default=0.5, help='weigh
 parser.add_argument('--ce_weight', type=float, default=1.0, help='weight for cross-entropy loss')
 parser.add_argument('--val_split', type=float, default=0.2, help='validation split for classification')
 parser.add_argument('--pair_mode', type=int, default=1, help='1: train with pair sampling + CE, 0: CE only')
+parser.add_argument('--test_split', type=float, default=0.2,
+                    help='held-out test split for classification (used by AD windowed dataset)')
+parser.add_argument('--target_len', type=int, default=256,
+                    help='window length for AD windowing (e.g., 256 to match the paper)')
 
 # data loader
 parser.add_argument('--data', type=str, required=True, default='ETTm1', help='dataset type')
