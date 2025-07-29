@@ -172,3 +172,19 @@ class Exp_Classify:
         metrics = self._evaluate(loader, task=self.cfg.task)
         print("Test metrics:", metrics)
         return metrics
+
+    def collate_pair(batch):
+        # batch: list of (xi, xj, y_sim, y_cls)
+        xi, xj, y_sim, y_cls = zip(*batch)
+        xi = torch.stack([t.contiguous() for t in xi], dim=0)   # (B, C, L)
+        xj = torch.stack([t.contiguous() for t in xj], dim=0)   # (B, C, L)
+        y_sim = torch.stack(list(y_sim), dim=0)                 # (B,)
+        y_cls = torch.stack(list(y_cls), dim=0)                 # (B,)
+        return xi, xj, y_sim, y_cls
+    
+    def collate_single(batch):
+        # batch: list of (x, y)
+        x, y = zip(*batch)
+        x = torch.stack([t.contiguous() for t in x], dim=0)     # (B, C, L)
+        y = torch.stack(list(y), dim=0)                         # (B,)
+        return x, y
