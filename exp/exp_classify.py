@@ -31,6 +31,7 @@ class TrainConfig:
 class Exp_Classify:
     def __init__(self, args):
         # Map run.py args to our config (with sensible defaults)
+        self.args = args
         self.cfg = TrainConfig(
             data_dir = args.data_root if hasattr(args, 'data_root') else './AD',
             task = getattr(args, 'cls_task', 'binary'),
@@ -67,6 +68,15 @@ class Exp_Classify:
         # Build model with fixed in_channels (max across dataset)
         self.num_classes = base_ds.num_classes
         self.model = SiameseClassifier(self.fixed_C, self.num_classes, emb_dim=self.cfg.emb_dim).to(self.cfg.device)
+
+        ckpt = getattr(self.args, 'load_checkpoints', None)
+        if ckpt:
+            if os.path.exists(ckpt):
+                state = torch.load(ckpt, map_location='cpu')
+                self.model.load_state_dict(state)
+                print(f"Loaded checkpoint: {ckpt}")
+            else:
+                print(f"[Warn] --load_checkpoints given but file not found: {ckpt}")
 
         # Build splits & mirror datasets for CE (single) mode
         full_len = len(base_ds)
@@ -230,6 +240,17 @@ class Exp_Classify:
             print(f"Saved last model to {ckpt_path}")
 
     def test(self, setting=None, test=0):
+        # --- auto-pick checkpoint if not provided ---
+        ckpt = getattr(self.args, 'load_checkpoints', None)
+        if ckpt is None:
+            ckpt = f'./outputs/checkpoints_classify/{(setting or "classify")}_{self.cfg.task}.pt'
+        if os.path.exists(ckpt):
+            state = torch.load(ckpt, map_location='cpu')
+            self.model.load_state_dict(state)
+            print(f"Loaded checkpoint for test: {ckpt}")
+        else:
+            print(f"[Warn] No checkpoint found at {ckpt}; testing current weights.")
+
         # Evaluate on the full dataset (single-sample)
         full_ds = ADDataset(self.cfg.data_dir, task=self.cfg.task, pair_mode=False)
         loader = DataLoader(
@@ -237,8 +258,9 @@ class Exp_Classify:
             batch_size=self.cfg.batch_size,
             shuffle=False,
             num_workers=self.cfg.num_workers,
-            collate_fn=self._collate_single,    # <— use custom collate
+            collate_fn=self._collate_single,
         )
         metrics = self._evaluate(loader, task=self.cfg.task)
         print("Test metrics:", metrics)
         return metrics
+
