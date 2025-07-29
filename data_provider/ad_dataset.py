@@ -37,10 +37,33 @@ class ADDataset(Dataset):
         else:
             raise ValueError("task must be 'binary' or 'id'")
 
-        # Precompute indices per class
+        # Global class -> indices (full dataset)
         self.cls_to_indices = {}
         for i, c in enumerate(self.y):
             self.cls_to_indices.setdefault(int(c), []).append(i)
+
+        # ---- Sampling pool (train-only) ----
+        # If set via set_pair_sampling_pool(), pair-mode sampling will be restricted to this pool.
+        self._pool_indices = None
+        self._cls_to_pool = None
+
+    def set_pair_sampling_pool(self, indices):
+        """
+        Restrict positive/negative sampling to these dataset indices (e.g., train_idx).
+        `indices` can be list/ndarray of ints (global dataset indices).
+        """
+        if indices is None:
+            self._pool_indices = None
+            self._cls_to_pool = None
+            return
+
+        pool = np.array(indices, dtype=int)
+        self._pool_indices = pool
+        cls_to_pool = {}
+        for gid in pool:
+            c = int(self.y[gid])
+            cls_to_pool.setdefault(c, []).append(int(gid))
+        self._cls_to_pool = cls_to_pool
 
     def __len__(self):
         return len(self.X)
@@ -50,36 +73,47 @@ class ADDataset(Dataset):
         if x.ndim != 3:
             raise ValueError(f"{self.X[idx]} has shape {x.shape}; expected (C, L, F)")
         C, L, F = x.shape
-        # --- IMPORTANT: ensure contiguous OWNED memory before from_numpy ---
         x = np.ascontiguousarray(x.reshape(C * F, L).astype(np.float32)).copy()
-        t = torch.from_numpy(x)  # (C*F, L)
-        # in rare cases, enforce contiguous torch memory too
+        t = torch.from_numpy(x)
         return t.contiguous()
 
+    # ------- helpers that respect the sampling pool if set -------
     def _sample_positive(self, cls: int, exclude_idx: int) -> int:
-        pool = self.cls_to_indices[cls]
+        # Prefer pool-restricted indices
+        pool = None
+        if self._cls_to_pool is not None and cls in self._cls_to_pool:
+            pool = self._cls_to_pool[cls]
+        else:
+            pool = self.cls_to_indices[cls]
+
         if len(pool) == 1:
             return exclude_idx
         while True:
-            j = np.random.choice(pool)
+            j = int(np.random.choice(pool))
             if j != exclude_idx:
                 return j
 
     def _sample_negative(self, cls: int) -> int:
-        other = [c for c in self.cls_to_indices.keys() if c != cls]
+        # Choose a different class
+        all_classes = list(self.cls_to_indices.keys())
+        other = [c for c in all_classes if c != cls]
         c2 = int(np.random.choice(other))
-        return int(np.random.choice(self.cls_to_indices[c2]))
+
+        if self._cls_to_pool is not None and c2 in self._cls_to_pool and len(self._cls_to_pool[c2]) > 0:
+            return int(np.random.choice(self._cls_to_pool[c2]))
+        else:
+            return int(np.random.choice(self.cls_to_indices[c2]))
 
     def __getitem__(self, idx: int):
         if not self.pair_mode:
-            x = self._load_x(idx).float()            
+            x = self._load_x(idx).float()
             y = int(self.y[idx])
-            # --- return tensors with owned storage/dtypes set ---
             return x.float(), torch.tensor(y, dtype=torch.long)
 
         # Pair mode
         y_anchor = int(self.y[idx])
-        if np.random.rand() < 0.5 and len(self.cls_to_indices[y_anchor]) > 0:
+        # Sample within pool if defined
+        if np.random.rand() < 0.5:
             j = self._sample_positive(y_anchor, idx)
             y_sim = 1
         else:
@@ -88,8 +122,6 @@ class ADDataset(Dataset):
 
         xi = self._load_x(idx).float()
         xj = self._load_x(j).float()
-
-        # --- make labels tensors now to avoid dtype surprises in collate ---
-        y_sim = torch.tensor(y_sim, dtype=torch.float32)  # contrastive target
+        y_sim = torch.tensor(y_sim, dtype=torch.float32)
         y_anchor = torch.tensor(y_anchor, dtype=torch.long)
         return xi.float(), xj.float(), y_sim, y_anchor
