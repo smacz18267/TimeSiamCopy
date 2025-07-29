@@ -113,11 +113,11 @@ class Exp_Classify:
     def train(self, setting=None):
         print("Starting classification training with config:", self.cfg)
         train_pair_loader = DataLoader(self.train_pair, batch_size=self.cfg.batch_size, shuffle=True,
-                                       num_workers=self.cfg.num_workers, drop_last=False)
+                                       num_workers=self.cfg.num_workers, drop_last=False, collate_fn=collate_pair)
         train_ce_loader = DataLoader(self.train_ce, batch_size=self.cfg.batch_size, shuffle=True,
-                                     num_workers=self.cfg.num_workers, drop_last=False)
+                                     num_workers=self.cfg.num_workers, drop_last=False, collate_fn=collate_single)
         val_loader = DataLoader(self.val_ce, batch_size=self.cfg.batch_size, shuffle=False,
-                                num_workers=self.cfg.num_workers, drop_last=False)
+                                num_workers=self.cfg.num_workers, drop_last=False, collate_fn=collate_single)
 
         best_metric = -np.inf
         best_state = None
