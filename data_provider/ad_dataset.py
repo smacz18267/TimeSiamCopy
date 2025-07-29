@@ -2,9 +2,15 @@ import os
 import numpy as np
 import torch
 from torch.utils.data import Dataset
-from typing import Tuple, Optional, List
 
 class ADDataset(Dataset):
+    """
+    AD dataset:
+      data_dir/
+        Feature/*.npy    each (C, L, F)
+        Label/label.npy  shape (N, 2): [:,0] binary, [:,1] ID
+    """
+
     def __init__(self, data_dir: str, task: str = "binary", pair_mode: bool = True):
         super().__init__()
         self.data_dir = data_dir
@@ -18,66 +24,72 @@ class ADDataset(Dataset):
         labels = np.load(os.path.join(data_dir, "Label", "label.npy"))
         if labels.ndim != 2 or labels.shape[0] != len(self.X) or labels.shape[1] < 2:
             raise ValueError(f"Unexpected label shape: {labels.shape}; expected (N,2) matching features")
-        self.labels_raw = labels
 
         if task == "binary":
-            self.y = labels[:,0].astype(int)
+            self.y = labels[:, 0].astype(int)
             self.num_classes = 2
         elif task == "id":
-            ids = labels[:,1].astype(int)
-            unique_ids = sorted(np.unique(ids).tolist())
-            id_to_idx = {idv:i for i,idv in enumerate(unique_ids)}
-            self.y = np.array([id_to_idx[i] for i in ids], dtype=int)
-            self.num_classes = len(unique_ids)
+            ids = labels[:, 1].astype(int)
+            uniq = sorted(np.unique(ids).tolist())
+            idx_map = {v: i for i, v in enumerate(uniq)}
+            self.y = np.array([idx_map[v] for v in ids], dtype=int)
+            self.num_classes = len(uniq)
         else:
             raise ValueError("task must be 'binary' or 'id'")
 
+        # Precompute indices per class
         self.cls_to_indices = {}
-        for idx, c in enumerate(self.y):
-            self.cls_to_indices.setdefault(c, []).append(idx)
-
-        self.indices = np.arange(len(self.X))
+        for i, c in enumerate(self.y):
+            self.cls_to_indices.setdefault(int(c), []).append(i)
 
     def __len__(self):
         return len(self.X)
 
     def _load_x(self, idx: int) -> torch.Tensor:
-        x = np.load(self.X[idx])
+        x = np.load(self.X[idx])  # (C, L, F)
         if x.ndim != 3:
-            raise ValueError(f"Feature at {self.X[idx]} has shape {x.shape}; expected (C, L, F)")
+            raise ValueError(f"{self.X[idx]} has shape {x.shape}; expected (C, L, F)")
         C, L, F = x.shape
-        x = x.astype(np.float32)
-        x = x.reshape(C*F, L)
-        return torch.from_numpy(x)
+        # --- IMPORTANT: ensure contiguous OWNED memory before from_numpy ---
+        x = np.ascontiguousarray(x.reshape(C * F, L).astype(np.float32)).copy()
+        t = torch.from_numpy(x)  # (C*F, L)
+        # in rare cases, enforce contiguous torch memory too
+        return t.contiguous()
 
     def _sample_positive(self, cls: int, exclude_idx: int) -> int:
-        choices = self.cls_to_indices[cls]
-        if len(choices) == 1:
+        pool = self.cls_to_indices[cls]
+        if len(pool) == 1:
             return exclude_idx
         while True:
-            j = np.random.choice(choices)
+            j = np.random.choice(pool)
             if j != exclude_idx:
                 return j
 
     def _sample_negative(self, cls: int) -> int:
-        other_classes = [c for c in self.cls_to_indices.keys() if c != cls]
-        c2 = np.random.choice(other_classes)
-        return np.random.choice(self.cls_to_indices[c2])
+        other = [c for c in self.cls_to_indices.keys() if c != cls]
+        c2 = int(np.random.choice(other))
+        return int(np.random.choice(self.cls_to_indices[c2]))
 
     def __getitem__(self, idx: int):
         if not self.pair_mode:
-            x = self._load_x(idx)
+            x = self._load_x(idx)                  # (C*F, L)
             y = int(self.y[idx])
-            return x, y
+            # --- return tensors with owned storage/dtypes set ---
+            return x.float(), torch.tensor(y, dtype=torch.long)
 
-        y = int(self.y[idx])
-        if np.random.rand() < 0.5 and len(self.cls_to_indices[y]) > 0:
-            j = self._sample_positive(y, idx)
-            label = 1
+        # Pair mode
+        y_anchor = int(self.y[idx])
+        if np.random.rand() < 0.5 and len(self.cls_to_indices[y_anchor]) > 0:
+            j = self._sample_positive(y_anchor, idx)
+            y_sim = 1
         else:
-            j = self._sample_negative(y)
-            label = 0
+            j = self._sample_negative(y_anchor)
+            y_sim = 0
 
-        xi = self._load_x(idx)
-        xj = self._load_x(j)
-        return xi, xj, int(label), y
+        xi = self._load_x(idx).float()
+        xj = self._load_x(j).float()
+
+        # --- make labels tensors now to avoid dtype surprises in collate ---
+        y_sim = torch.tensor(y_sim, dtype=torch.float32)  # contrastive target
+        y_anchor = torch.tensor(y_anchor, dtype=torch.long)
+        return xi, xj, y_sim, y_anchor
