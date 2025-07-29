@@ -33,10 +33,10 @@ class TrainConfig:
 
 class Exp_Classify:
     def __init__(self, args):
-        # Keep a handle to args for checkpoint routing in test()
+        # Keep args so test() can auto-pick a checkpoint if --load_checkpoints is not given
         self.args = args
 
-        # Map CLI args -> config with sane defaults
+        # Map CLI args => config
         self.cfg = TrainConfig(
             data_dir = getattr(args, 'data_root', './AD'),
             task = getattr(args, 'cls_task', 'binary'),
@@ -56,18 +56,17 @@ class Exp_Classify:
         torch.manual_seed(self.cfg.seed)
         np.random.seed(self.cfg.seed)
 
-        # -------- Load base dataset (pair-mode for contrastive; we will make a CE clone) --------
+        # -------- Load base dataset (pair-mode for contrastive; CE uses a no-pair clone) --------
         base_ds = ADDataset(self.cfg.data_dir, task=self.cfg.task, pair_mode=self.cfg.pair_mode)
 
-        # -------- Determine fixed (C,L) from the WHOLE dataset (quick scan via mmap) ----------
-        # Many AD features are saved as (C, L, F). We flatten channels to C*F.
+        # -------- Determine fixed (C,L) across the whole dataset (fast scan via mmap) ----------
+        # Your ADDataset returns (C*F, L). We still handle (C,L,F) defensively.
         max_C, max_L = 0, 0
-        for p in base_ds.X:  # list of feature .npy paths
-            shp = np.load(p, mmap_mode='r').shape  # (C,L) or (C,L,F)
+        for p in base_ds.X:
+            shp = np.load(p, mmap_mode='r').shape
             if len(shp) == 3:
-                C, L, F = shp
-                C = int(C) * int(F)
-                L = int(L)
+                C, L, F = map(int, shp)
+                C = C * F
             else:
                 C, L = int(shp[0]), int(shp[1])
             max_C = max(max_C, C)
@@ -75,8 +74,8 @@ class Exp_Classify:
         self.fixed_C = max_C
         self.fixed_L = max_L
 
-        # -------- Build model --------
-        self.num_classes = base_ds.num_classes  # e.g., 2 for binary
+        # -------- Model --------
+        self.num_classes = base_ds.num_classes
         self.model = SiameseClassifier(self.fixed_C, self.num_classes, emb_dim=self.cfg.emb_dim).to(self.cfg.device)
 
         # --- optional: load checkpoint if provided via --load_checkpoints
@@ -89,15 +88,13 @@ class Exp_Classify:
             else:
                 print(f"[Warn] --load_checkpoints given but file not found: {ckpt}")
 
-        # -------- Split datasets: pair-mode for contrastive, single-sample for CE ----------
+        # -------- Splits: pair-mode for contrastive; single-sample for CE ----------
         full_len = len(base_ds)
         val_len = max(1, int(full_len * self.cfg.val_split))
         train_len = full_len - val_len
 
-        # Train/val for pair-mode (contrastive)
         self.train_pair, self.val_pair = random_split(base_ds, [train_len, val_len])
 
-        # Train/val for single-sample CE
         ds_ce = ADDataset(self.cfg.data_dir, task=self.cfg.task, pair_mode=False)
         self.train_ce, self.val_ce = random_split(ds_ce, [train_len, val_len])
 
@@ -108,7 +105,7 @@ class Exp_Classify:
 
     def _pad_to_fixed(self, x: torch.Tensor) -> torch.Tensor:
         """
-        x can be (C,L) or (C,L,F). If 3D, flatten to (C*F, L). Then pad/truncate to (fixed_C, fixed_L).
+        Accepts (C,L) or (C,L,F) tensor. Flattens 3D to (C*F,L), then pad/truncate to (fixed_C, fixed_L).
         """
         x = torch.as_tensor(x)
         if x.ndim == 3:
@@ -156,7 +153,7 @@ class Exp_Classify:
         logits = self.model(x)
         return nn.CrossEntropyLoss()(logits, y)
 
-    # ======================= Eval (simple: acc + AUC if binary) =======================
+    # ======================= Eval (binary: acc + AUC; multi: acc) =======================
 
     def _evaluate(self, loader, task='binary'):
         self.model.eval()
@@ -171,7 +168,6 @@ class Exp_Classify:
         ys = np.concatenate(ys, axis=0)
         ps = np.concatenate(ps, axis=0)
 
-        # For "binary", take column 1 as positive
         if task == 'binary' and ps.shape[1] >= 2:
             from sklearn.metrics import accuracy_score, roc_auc_score
             acc = accuracy_score(ys, ps.argmax(axis=1))
@@ -190,7 +186,7 @@ class Exp_Classify:
     def train(self, setting=None):
         print("Starting classification training with config:", self.cfg)
 
-        # Build loaders
+        # Loaders
         train_pair_loader = DataLoader(
             self.train_pair, batch_size=self.cfg.batch_size, shuffle=True,
             num_workers=self.cfg.num_workers, drop_last=False, collate_fn=self._collate_pair
@@ -206,7 +202,7 @@ class Exp_Classify:
             num_workers=self.cfg.num_workers, drop_last=False, collate_fn=self._collate_single
         )
 
-        # How many gradient steps per epoch
+        # Steps per epoch
         steps = 0
         if train_pair_loader is not None: steps = len(train_pair_loader)
         if train_ce_loader is not None:   steps = max(steps, len(train_ce_loader))
@@ -242,10 +238,11 @@ class Exp_Classify:
                 loss = loss_c + loss_e
                 loss.backward()
                 self.opt.step()
+
                 total_c += float(loss_c.detach().cpu())
                 total_ce += float(loss_e.detach().cpu())
 
-            # Validate
+            # Validation
             metrics = self._evaluate(val_loader, task=self.cfg.task)
             score = metrics.get('auc', metrics.get('acc', 0.0)) if self.cfg.task == 'binary' else metrics.get('acc', 0.0)
             print(f"Epoch {epoch+1}/{self.cfg.epochs} | contrastive: {total_c/max(1,steps):.4f} | ce: {total_ce/max(1,steps):.4f} | val: {metrics}")
@@ -265,7 +262,7 @@ class Exp_Classify:
             print(f"Saved last model to {ckpt_path}")
 
     def test(self, setting=None, test=0):
-        # --- auto-pick checkpoint if not provided ---
+        # Auto-pick checkpoint if not provided
         ckpt = getattr(self.args, 'load_checkpoints', None)
         if ckpt is None:
             ckpt = f'./outputs/checkpoints_classify/{(setting or "classify")}_{self.cfg.task}.pt'
@@ -276,7 +273,7 @@ class Exp_Classify:
         else:
             print(f"[Warn] No checkpoint found at {ckpt}; testing current weights.")
 
-        # Evaluate on the full dataset (single-sample)
+        # Evaluate on full dataset (single-sample)
         full_ds = ADDataset(self.cfg.data_dir, task=self.cfg.task, pair_mode=False)
         loader = DataLoader(
             full_ds,
